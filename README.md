@@ -27,6 +27,32 @@ Auth is a single bearer token (`MAKEFUN_SHOP_TOKEN`); the viewer is the
 fixed scenario account. All responses are deterministic (no wall clock in
 any payload: timestamps come from `MAKEFUN_TRIAL_NOW`).
 
+## Go core (2026-11-18)
+
+The entry now runs a statically linked Go binary instead of the TypeScript
+server. `main.ts` is a thin shim that execs the vendored `./forge` binary
+(built from `./go` with `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`,
+linux/amd64, 3.3 MB — under the 8 MiB per-file cap). The Go code is a
+behavior-identical port of the TypeScript sources in this repo (same routes,
+same wire bytes), with the top-10 pattern applied: raw-TCP HTTP/1.1 server
+(no `net/http`), zero-alloc hot paths, single-inflate pack ingest, and a
+pre-serialized MCP `tools/list` payload. `go vet` clean, `go test ./...`
+passes (pack round-trip incl. ref-deltas). The TypeScript sources stay in
+the repo as the port source.
+
+Local grade (kit `grade-local`, `--driver process`, 2026-11-18, 1 instance):
+
+| trial | feature | agent | perf | p50 (µs) | score | replay |
+|------:|--------:|------:|-----:|---------:|------:|:------:|
+| 0 | 600/600 | 200/200 | 169 | 302,582 | **969** | ok |
+
+Same-day TypeScript baseline on the same machine: 959 (perf 159,
+p50 359,521 µs). A 3-instance Go run averaged 938 (90% interval 898–979)
+under heavy VM contention (load ~4.6 on 1.5 shared CPUs while other agents
+built in parallel), so treat local numbers as noisy — the server's
+production cluster grades the commit. The entry is built and verified
+only; it has NOT been submitted.
+
 ## Local grade (kit `grade-local`, `--driver process`, 2026-11-14)
 
 | trial | feature | agent | perf | score | replay |
@@ -46,8 +72,13 @@ i.e. it answers the four timed workloads faster than the house reference.
 node --experimental-strip-types main.ts
 ```
 
-`main.ts` is the harness lifecycle (bind an ephemeral port, register with
-`$MAKEFUN_ENV_URL`, poll `/done`, exit 0). `app.ts` is the server.
+`main.ts` is a shim that execs the vendored Go binary `./forge`. The binary
+owns the harness lifecycle (bind an ephemeral port, register with
+`$MAKEFUN_ENV_URL`, poll `/done`, exit 0). To rebuild it:
+
+```sh
+cd go && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../forge .
+```
 
 ## Layout
 
