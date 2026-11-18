@@ -54,8 +54,10 @@ Same-day TypeScript baseline on the same machine: 959 (perf 159,
 p50 359,521 µs). A 3-instance Go run averaged 938 (90% interval 898–979)
 under heavy VM contention (load ~4.6 on 1.5 shared CPUs while other agents
 built in parallel), so treat local numbers as noisy — the server's
-production cluster grades the commit. The entry is built and verified
-only; it has NOT been submitted.
+production cluster grades the commit. Submitted 2026-11-18 23:24 WIB as
+01a1ef79-be41-769b-ba8f-a7d793aebddd (claim AF-1YPGG-JA0ER-AE47W-0GJR9) —
+SCORED, dev phase, all 28 server checks pass; numeric score on the
+leaderboard.
 
 ## Local grade (kit `grade-local`, `--driver process`, 2026-11-14)
 
