@@ -17,7 +17,31 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+// Pooled zlib (de)compressors: a fresh compress/zlib writer allocates ~800 KiB
+// of compressor state per object, which dominated encodePack (2.4 MiB/op for
+// a 3-object shallow fetch). Writers are Reset before each use; readers are
+// Reset with a fresh bytes.Reader. sync.Pool is goroutine-safe, so 50
+// concurrent clones each get their own compressor.
+var zlibWriterPool = sync.Pool{New: func() interface{} {
+	zw, _ := zlib.NewWriterLevel(nil, 6)
+	return zw
+}}
+
+var emptyZlibStream = func() []byte {
+	var b bytes.Buffer
+	zw := zlib.NewWriter(&b)
+	zw.Write([]byte{})
+	zw.Close()
+	return b.Bytes()
+}()
+
+var zlibReaderPool = sync.Pool{New: func() interface{} {
+	zr, _ := zlib.NewReader(bytes.NewReader(emptyZlibStream))
+	return zr
+}}
 
 type ObjectType string
 
@@ -257,11 +281,34 @@ func encodePack(objects []PackObject) []byte {
 	tmp[2] = byte(n >> 8)
 	tmp[3] = byte(n)
 	body.Write(tmp[:])
+	var hdr [8]byte
 	for _, obj := range objects {
-		body.Write(encodeObjectHeader(obj.Type, len(obj.Content)))
-		zw, _ := zlib.NewWriterLevel(&body, 6)
+		// Object header into a stack array (no per-object slice alloc).
+		hdrLen := 0
+		code := typeCodes[obj.Type]
+		size := len(obj.Content)
+		b := (code << 4) | byte(size&0x0f)
+		size >>= 4
+		if size > 0 {
+			b |= 0x80
+		}
+		hdr[hdrLen] = b
+		hdrLen++
+		for size > 0 {
+			b = byte(size & 0x7f)
+			size >>= 7
+			if size > 0 {
+				b |= 0x80
+			}
+			hdr[hdrLen] = b
+			hdrLen++
+		}
+		body.Write(hdr[:hdrLen])
+		zw := zlibWriterPool.Get().(*zlib.Writer)
+		zw.Reset(&body)
 		zw.Write(obj.Content)
 		zw.Close()
+		zlibWriterPool.Put(zw)
 	}
 	sum := sha1.Sum(body.Bytes())
 	return append(body.Bytes(), sum[:]...)
@@ -274,12 +321,14 @@ func encodePack(objects []PackObject) []byte {
 // of the stream (zlib streams end on a byte boundary).
 func inflateOne(buf []byte, pos int) ([]byte, int, error) {
 	br := bytes.NewReader(buf[pos:])
-	zr, err := zlib.NewReader(br)
-	if err != nil {
+	zr := zlibReaderPool.Get().(io.ReadCloser)
+	if err := zr.(zlib.Resetter).Reset(br, nil); err != nil {
+		zlibReaderPool.Put(zr)
 		return nil, 0, errors.New("pack: bad zlib stream")
 	}
 	data, err := io.ReadAll(zr)
 	zr.Close()
+	zlibReaderPool.Put(zr)
 	if err != nil {
 		return nil, 0, errors.New("pack: bad zlib stream")
 	}
