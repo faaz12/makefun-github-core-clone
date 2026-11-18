@@ -9,8 +9,11 @@ import (
 	"compress/zlib"
 	"crypto/sha1"
 	"fmt"
+	"sort"
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 )
 
 func seedRepo200(tb testing.TB) *Repo {
@@ -133,6 +136,75 @@ func BenchmarkHandleRequestPostIssue(b *testing.B) {
 		if resp.Status != 201 {
 			b.Fatalf("status %d", resp.Status)
 		}
+	}
+}
+
+func BenchmarkFetchResponseV2ShallowParallel(b *testing.B) {
+	repo := seedRepo200(b)
+	args := shallowFetchArgs(repo)
+	// Per-goroutine latency slices; merged at the end for percentiles.
+	var mu sync.Mutex
+	var all []time.Duration
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		var local []time.Duration
+		for pb.Next() {
+			start := time.Now()
+			out := fetchResponse(repo, args, true)
+			if len(out) == 0 {
+				b.Fatal("empty fetch response")
+			}
+			local = append(local, time.Since(start))
+		}
+		mu.Lock()
+		all = append(all, local...)
+		mu.Unlock()
+	})
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+	n := len(all)
+	if n > 0 {
+		pct := func(p float64) time.Duration { return all[int(float64(n)*p)] }
+		b.Logf("parallel fetch n=%d p50=%s p95=%s p99=%s max=%s", n, pct(0.50), pct(0.95), pct(0.99), all[n-1])
+	}
+}
+
+func BenchmarkHandleUploadPackShallowParallel(b *testing.B) {
+	repo := seedRepo200(b)
+	tip := repo.DefaultTip()
+	var body bytes.Buffer
+	writePkt := func(s string) {
+		body.WriteString(fmt.Sprintf("%04x%s", len(s)+4, s))
+	}
+	writePkt("command=fetch\n")
+	body.WriteString("0001")
+	writePkt("want " + tip + "\n")
+	writePkt("deepen 1\n")
+	body.WriteString("0000")
+	req := body.Bytes()
+	var mu sync.Mutex
+	var all []time.Duration
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		var local []time.Duration
+		for pb.Next() {
+			start := time.Now()
+			resp := handleUploadPack(repo, req)
+			if resp.Status != 200 || len(resp.Body) == 0 {
+				b.Fatalf("upload-pack status %d len %d", resp.Status, len(resp.Body))
+			}
+			local = append(local, time.Since(start))
+		}
+		mu.Lock()
+		all = append(all, local...)
+		mu.Unlock()
+	})
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+	n := len(all)
+	if n > 0 {
+		pct := func(p float64) time.Duration { return all[int(float64(n)*p)] }
+		b.Logf("parallel upload-pack n=%d p50=%s p95=%s p99=%s max=%s", n, pct(0.50), pct(0.95), pct(0.99), all[n-1])
 	}
 }
 
