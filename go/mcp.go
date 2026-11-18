@@ -68,7 +68,7 @@ var mcpTools = []mcpTool{
 	{"create_pull_request", "Create a pull request in a repository.", schema(map[string]interface{}{
 		"owner": prop("Repository owner login"), "repo": prop("Repository name"),
 		"full_name": prop("owner/repo"), "title": prop("Pull request title"),
-		"body": prop("Issue body"), "head": prop("Head branch name"), "base": prop("Base branch name"),
+		"body": prop("Pull request body"), "head": prop("Head branch name"), "base": prop("Base branch name"),
 	}, []string{"owner", "repo", "title", "head", "base"})},
 	{"merge_pull_request", "Merge a pull request with a squash merge.", schema(map[string]interface{}{
 		"owner": prop("Repository owner login"), "repo": prop("Repository name"),

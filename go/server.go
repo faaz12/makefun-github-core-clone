@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -118,56 +120,117 @@ func (cn *conn) header(name string, headers [][2]string) string {
 }
 
 // readRequest reads one request: method, target, version, headers, body.
-func (cn *conn) readRequest() (method, target, version string, headers [][2]string, body []byte, err error) {
+// Parse failures return errParse (the caller answers 400) or errHeaderTooLarge
+// (the caller answers 431); a clean EOF returns io.EOF so the caller just
+// closes. This mirrors Node's llhttp behavior for malformed traffic.
+var errParse = fmt.Errorf("bad request")
+var errHeaderTooLarge = fmt.Errorf("headers too large")
+
+var validMethods = map[string]bool{
+	"GET": true, "HEAD": true, "POST": true, "PUT": true, "DELETE": true,
+	"CONNECT": true, "OPTIONS": true, "TRACE": true, "PATCH": true,
+}
+
+func (cn *conn) readLineCRLF() (string, error) {
 	line, err := cn.br.ReadString('\n')
 	if err != nil {
-		return "", "", "", nil, nil, err
+		return "", err
 	}
-	line = strings.TrimRight(line, "\r\n")
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) != 3 {
-		return "", "", "", nil, nil, fmt.Errorf("bad request line")
+	if !strings.HasSuffix(line, "\r\n") {
+		return "", errParse
 	}
-	method, target, version = parts[0], parts[1], parts[2]
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+func (cn *conn) readRequest() (method, target, version string, headers [][2]string, body []byte, err error) {
+	// Tolerate leading empty lines (RFC 9112 s2.2: at least one), counting
+	// them toward the header budget.
+	headerBytes := 0
+	line := ""
 	for {
-		hline, err := cn.br.ReadString('\n')
+		line, err = cn.readLineCRLF()
 		if err != nil {
 			return "", "", "", nil, nil, err
 		}
-		hline = strings.TrimRight(hline, "\r\n")
+		headerBytes += len(line) + 2
+		if headerBytes > 16384 {
+			return "", "", "", nil, nil, errHeaderTooLarge
+		}
+		if line != "" {
+			break
+		}
+	}
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) != 3 {
+		return "", "", "", nil, nil, errParse
+	}
+	method, target, version = parts[0], parts[1], parts[2]
+	if !validMethods[method] {
+		return "", "", "", nil, nil, errParse
+	}
+	if version != "HTTP/1.0" && version != "HTTP/1.1" {
+		return "", "", "", nil, nil, errParse
+	}
+	clCount := 0
+	for {
+		hline, err := cn.readLineCRLF()
+		if err != nil {
+			return "", "", "", nil, nil, err
+		}
+		headerBytes += len(hline) + 2
+		if headerBytes > 16384 {
+			return "", "", "", nil, nil, errHeaderTooLarge
+		}
 		if hline == "" {
 			break
 		}
-		if i := strings.IndexByte(hline, ':'); i >= 0 {
-			headers = append(headers, [2]string{strings.TrimSpace(hline[:i]), strings.TrimSpace(hline[i+1:])})
+		i := strings.IndexByte(hline, ':')
+		if i < 0 {
+			return "", "", "", nil, nil, errParse
+		}
+		name := strings.TrimSpace(hline[:i])
+		value := strings.TrimSpace(hline[i+1:])
+		headers = append(headers, [2]string{name, value})
+		if strings.EqualFold(name, "Content-Length") {
+			clCount++
 		}
 	}
 	if method == "GET" || method == "HEAD" {
 		return method, target, version, headers, nil, nil
 	}
-	// Body: Content-Length or chunked.
+	// Body: Content-Length or chunked. Duplicate Content-Length, or
+	// Content-Length together with Transfer-Encoding, is a 400 (smuggling).
 	te := cn.header("Transfer-Encoding", headers)
+	cl := cn.header("Content-Length", headers)
+	if clCount > 1 || (cl != "" && te != "") {
+		return "", "", "", nil, nil, errParse
+	}
+	// Expect: 100-continue — answer it before reading the body, like Node.
+	if strings.EqualFold(strings.TrimSpace(cn.header("Expect", headers)), "100-continue") {
+		if _, werr := cn.c.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n")); werr != nil {
+			return "", "", "", nil, nil, werr
+		}
+	}
 	if strings.Contains(strings.ToLower(te), "chunked") {
 		body, err = cn.readChunked()
 		if err != nil {
-			return "", "", "", nil, nil, err
+			return "", "", "", nil, nil, errParse
 		}
 		return method, target, version, headers, body, nil
 	}
-	cl := cn.header("Content-Length", headers)
 	if cl == "" {
 		return method, target, version, headers, nil, nil
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(cl))
 	if err != nil || n < 0 {
-		return "", "", "", nil, nil, fmt.Errorf("bad content-length")
+		return "", "", "", nil, nil, errParse
 	}
 	if n == 0 {
 		return method, target, version, headers, []byte{}, nil
 	}
 	body = make([]byte, n)
 	if _, err := readFull(cn.br, body); err != nil {
-		return "", "", "", nil, nil, err
+		return "", "", "", nil, nil, errParse
 	}
 	return method, target, version, headers, body, nil
 }
@@ -187,11 +250,10 @@ func readFull(br *bufio.Reader, buf []byte) (int, error) {
 func (cn *conn) readChunked() ([]byte, error) {
 	var out []byte
 	for {
-		line, err := cn.br.ReadString('\n')
+		line, err := cn.readLineCRLF()
 		if err != nil {
 			return nil, err
 		}
-		line = strings.TrimRight(line, "\r\n")
 		if i := strings.IndexByte(line, ';'); i >= 0 {
 			line = line[:i]
 		}
@@ -202,11 +264,11 @@ func (cn *conn) readChunked() ([]byte, error) {
 		if size == 0 {
 			// trailers until an empty line
 			for {
-				tline, err := cn.br.ReadString('\n')
+				tline, err := cn.readLineCRLF()
 				if err != nil {
 					return nil, err
 				}
-				if strings.TrimRight(tline, "\r\n") == "" {
+				if tline == "" {
 					break
 				}
 			}
@@ -218,13 +280,13 @@ func (cn *conn) readChunked() ([]byte, error) {
 		}
 		out = append(out, chunk...)
 		// trailing CRLF
-		if _, err := cn.br.ReadString('\n'); err != nil {
+		if _, err := cn.readLineCRLF(); err != nil {
 			return nil, err
 		}
 	}
 }
 
-func writeResponse(c net.Conn, status int, headers [][2]string, body []byte) error {
+func writeResponse(c net.Conn, status int, headers [][2]string, body []byte, headOnly bool) error {
 	var buf bytes.Buffer
 	reason, ok := reasonPhrases[status]
 	if !ok {
@@ -234,9 +296,14 @@ func writeResponse(c net.Conn, status int, headers [][2]string, body []byte) err
 	for _, h := range headers {
 		buf.WriteString(h[0] + ": " + h[1] + "\r\n")
 	}
-	buf.WriteString("Content-Length: " + strconv.Itoa(len(body)) + "\r\n")
+	// RFC 9110 s8.6: no Content-Length on a 204 (or 1xx) response.
+	if status != 204 {
+		buf.WriteString("Content-Length: " + strconv.Itoa(len(body)) + "\r\n")
+	}
 	buf.WriteString("\r\n")
-	buf.Write(body)
+	if !headOnly {
+		buf.Write(body)
+	}
 	_, err := c.Write(buf.Bytes())
 	return err
 }
@@ -245,14 +312,25 @@ func serveConn(c net.Conn) {
 	defer c.Close()
 	cn := &conn{c: c, br: bufio.NewReaderSize(c, 65536)}
 	for {
+		// Bound how long one request may take to arrive (slow-client guard);
+		// legitimate trial traffic arrives in milliseconds.
+		_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
 		method, target, version, headers, body, err := cn.readRequest()
 		if err != nil {
+			if err == errHeaderTooLarge {
+				_, _ = c.Write([]byte("HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"))
+			} else if err != io.EOF {
+				_, _ = c.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			}
 			return
 		}
+		_ = c.SetReadDeadline(time.Time{})
 		keepAlive := true
 		connHdr := strings.ToLower(cn.header("Connection", headers))
 		if version == "HTTP/1.0" {
-			keepAlive = connHdr == "keep-alive"
+			// Node answers HTTP/1.0 with Connection: close and closes, even
+			// when the request asks keep-alive (observed on Node 24).
+			keepAlive = false
 		} else if connHdr == "close" {
 			keepAlive = false
 		}
@@ -268,7 +346,7 @@ func serveConn(c net.Conn) {
 		if !keepAlive || closeAfter {
 			rh = append(rh, [2]string{"Connection", "close"})
 		}
-		if err := writeResponse(c, resp.Status, rh, resp.Body); err != nil {
+		if err := writeResponse(c, resp.Status, rh, resp.Body, method == "HEAD"); err != nil {
 			return
 		}
 		if !keepAlive || closeAfter {
@@ -306,6 +384,15 @@ func handleRequest(method, target string, headers [][2]string, body []byte) (res
 	rawPath, rawQuery := target, ""
 	if i := strings.IndexByte(target, '?'); i >= 0 {
 		rawPath, rawQuery = target[:i], target[i+1:]
+	}
+	// WHATWG URL: a target starting with "//" carries an authority (the env's
+	// Node server parses it that way), so "//api/..." does not route to /api.
+	if strings.HasPrefix(rawPath, "//") {
+		if i := strings.Index(rawPath[2:], "/"); i >= 0 {
+			rawPath = rawPath[2+i:]
+		} else {
+			rawPath = "/"
+		}
 	}
 	rawSegs := strings.Split(rawPath, "/")
 	segments := make([]string, 0, len(rawSegs))
@@ -408,7 +495,7 @@ func handleRequest(method, target string, headers [][2]string, body []byte) (res
 	// MCP.
 	if (method == "POST" || method == "DELETE") && len(segments) == 1 && segments[0] == "mcp" {
 		if method == "DELETE" {
-			return withID(Resp{Status: 200, Body: []byte(`{}`), ContentType: "application/json", Headers: map[string]string{"Mcp-Protocol-Version": "2026-07-28"}}), false
+			return withID(Resp{Status: 200, Body: []byte(`{}`), ContentType: "application/json"}), false
 		}
 		var parsed interface{}
 		if len(body) > 0 {

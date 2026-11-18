@@ -572,7 +572,7 @@ func deleteRepo(ctx *Ctx) Resp {
 		return notFoundResp("Repository not found")
 	}
 	ctx.Store.DeleteRepo(repo.Owner, repo.Name)
-	return Resp{Status: 204, Body: nil, ContentType: "application/json"}
+	return Resp{Status: 204, Body: nil, ContentType: ""}
 }
 
 // ---------------------------------------------------------------------------
