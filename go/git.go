@@ -8,7 +8,7 @@ package main
 
 import (
 	"bytes"
-	"compress/zlib"
+	"github.com/klauspost/compress/zlib"
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
@@ -267,7 +267,15 @@ type PackObject struct {
 
 func encodePack(objects []PackObject) []byte {
 	var body bytes.Buffer
-	body.Grow(12)
+	// Pre-size for the deflated payload: git objects deflate hard (the
+	// bench repo's 600 objects are ~600 KiB raw but ~46 KiB packed), so
+	// content/8 + slack avoids repeated buffer growth without
+	// over-reserving for the common shallow fetch (3 objects, ~3 KiB raw).
+	totalContent := 0
+	for _, obj := range objects {
+		totalContent += len(obj.Content)
+	}
+	body.Grow(totalContent/8 + 256)
 	body.WriteString("PACK")
 	var tmp [4]byte
 	tmp[0] = 0
@@ -311,7 +319,10 @@ func encodePack(objects []PackObject) []byte {
 		zlibWriterPool.Put(zw)
 	}
 	sum := sha1.Sum(body.Bytes())
-	return append(body.Bytes(), sum[:]...)
+	// Write the trailer checksum into the same buffer instead of copying
+	// the whole pack once more with append.
+	body.Write(sum[:])
+	return body.Bytes()
 }
 
 // inflateOne inflates exactly one zlib stream starting at pos and reports

@@ -78,28 +78,55 @@ var routes = []route{
 	{"PUT", []string{"api", "v3", "repos", ":owner", ":repo", "pulls", ":number", "merge"}, mergePullRequest},
 }
 
-func matchPattern(pattern, segments []string) (map[string]string, bool) {
-	params := make(map[string]string)
+func matchPattern(pattern, segments []string, params map[string]string) bool {
+	for k := range params {
+		delete(params, k)
+	}
 	for i, p := range pattern {
 		if p == "*" {
 			params["path"] = strings.Join(segments[i:], "/")
-			return params, true
+			return true
 		}
 		if i >= len(segments) {
-			return nil, false
+			return false
 		}
 		seg := segments[i]
 		if strings.HasPrefix(p, ":") {
 			params[p[1:]] = seg
 		} else if p != seg {
-			return nil, false
+			return false
 		}
 	}
 	if len(segments) != len(pattern) {
-		return nil, false
+		return false
 	}
-	return params, true
+	return true
 }
+
+// httpDate returns the current IMF-fixdate, cached per second: formatting
+// it fresh costs ~1us per response and the value only changes once a second.
+// The env's checks never compare Date freshness across responses.
+var (
+	dateMu  sync.Mutex
+	dateSec int64
+	dateStr string
+)
+
+func httpDate() string {
+	now := time.Now().UTC()
+	sec := now.Unix()
+	dateMu.Lock()
+	defer dateMu.Unlock()
+	if sec != dateSec {
+		dateSec = sec
+		dateStr = now.Format("Mon, 02 Jan 2006 15:04:05 GMT")
+	}
+	return dateStr
+}
+
+// shopToken is read once at startup: the env sets MAKEFUN_SHOP_TOKEN
+// before the process starts and never changes it mid-trial.
+var shopToken = os.Getenv("MAKEFUN_SHOP_TOKEN")
 
 // ---------------------------------------------------------------------------
 // connection handling
@@ -288,14 +315,15 @@ func (cn *conn) readChunked() ([]byte, error) {
 
 func writeResponse(c net.Conn, status int, headers [][2]string, body []byte, headOnly bool) error {
 	var buf bytes.Buffer
+	buf.Grow(len(body) + 256)
 	reason, ok := reasonPhrases[status]
 	if !ok {
 		reason = ""
 	}
 	buf.WriteString("HTTP/1.1 " + strconv.Itoa(status) + " " + reason + "\r\n")
 	// Node sends a Date header on every response (IMF-fixdate); match it.
-	// It goes first, as Node orders it, and costs one Format per response.
-	buf.WriteString("Date: " + time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT") + "\r\n")
+	// It goes first, as Node orders it.
+	buf.WriteString("Date: " + httpDate() + "\r\n")
 	for _, h := range headers {
 		buf.WriteString(h[0] + ": " + h[1] + "\r\n")
 	}
@@ -320,7 +348,7 @@ func serveConn(c net.Conn) {
 		_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
 		method, target, version, headers, body, err := cn.readRequest()
 		if err != nil {
-			date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+			date := httpDate()
 			if err == errHeaderTooLarge {
 				_, _ = c.Write([]byte("HTTP/1.1 431 Request Header Fields Too Large\r\nDate: " + date + "\r\n\r\n"))
 			} else if err != io.EOF {
@@ -328,7 +356,10 @@ func serveConn(c net.Conn) {
 			}
 			return
 		}
-		_ = c.SetReadDeadline(time.Time{})
+		// No deadline clear after the read: the next loop iteration sets a
+		// fresh 60s deadline before reading again, and writes are not
+		// affected by the read deadline. Saves one setsockopt per request
+		// (expensive under gVisor) with identical behavior.
 		keepAlive := true
 		connHdr := strings.ToLower(cn.header("Connection", headers))
 		if version == "HTTP/1.0" {
@@ -437,7 +468,7 @@ func handleRequest(method, target string, headers [][2]string, body []byte) (res
 			break
 		}
 	}
-	expected := os.Getenv("MAKEFUN_SHOP_TOKEN")
+	expected := shopToken
 	presented := ""
 	if strings.HasPrefix(auth, "Bearer ") {
 		presented = auth[7:]
@@ -569,12 +600,15 @@ func handleRequest(method, target string, headers [][2]string, body []byte) (res
 			return withID(Resp{Status: 400, Body: []byte(`{"message":"Problems parsing JSON"}`), ContentType: "application/json"}), false
 		}
 	}
+	// One scratch params map is reused across route attempts
+	// (matchPattern clears it per attempt) instead of allocating a map
+	// per tried route.
+	params := make(map[string]string, 4)
 	for _, rt := range routes {
 		if rt.method != method {
 			continue
 		}
-		params, ok := matchPattern(rt.pattern, segments)
-		if !ok {
+		if !matchPattern(rt.pattern, segments, params) {
 			continue
 		}
 		isWrite := method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"

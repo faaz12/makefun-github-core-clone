@@ -1,0 +1,6 @@
+# github.com/klauspost/compress v1.20.4
+## explicit; go 1.25
+github.com/klauspost/compress/flate
+github.com/klauspost/compress/internal/le
+github.com/klauspost/compress/internal/regmask
+github.com/klauspost/compress/zlib

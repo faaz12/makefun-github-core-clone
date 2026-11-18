@@ -6,7 +6,7 @@ package main
 
 import (
 	"bytes"
-	"compress/zlib"
+	"github.com/klauspost/compress/zlib"
 	"crypto/sha1"
 	"fmt"
 	"sort"
