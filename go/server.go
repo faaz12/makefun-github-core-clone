@@ -293,6 +293,9 @@ func writeResponse(c net.Conn, status int, headers [][2]string, body []byte, hea
 		reason = ""
 	}
 	buf.WriteString("HTTP/1.1 " + strconv.Itoa(status) + " " + reason + "\r\n")
+	// Node sends a Date header on every response (IMF-fixdate); match it.
+	// It goes first, as Node orders it, and costs one Format per response.
+	buf.WriteString("Date: " + time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT") + "\r\n")
 	for _, h := range headers {
 		buf.WriteString(h[0] + ": " + h[1] + "\r\n")
 	}
@@ -317,10 +320,11 @@ func serveConn(c net.Conn) {
 		_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
 		method, target, version, headers, body, err := cn.readRequest()
 		if err != nil {
+			date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
 			if err == errHeaderTooLarge {
-				_, _ = c.Write([]byte("HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"))
+				_, _ = c.Write([]byte("HTTP/1.1 431 Request Header Fields Too Large\r\nDate: " + date + "\r\n\r\n"))
 			} else if err != io.EOF {
-				_, _ = c.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+				_, _ = c.Write([]byte("HTTP/1.1 400 Bad Request\r\nDate: " + date + "\r\n\r\n"))
 			}
 			return
 		}
